@@ -1,5 +1,5 @@
 {
-  "name": "@andreaacanfora/hl-exec",
+  "name": "@andreaaca/hl-exec",
   "version": "0.1.0",
   "description": "Production order execution for Hyperliquid perps: maker-first ladders, partial-fill-safe closes, native TP/SL, fill and funding accounting.",
   "license": "MIT",

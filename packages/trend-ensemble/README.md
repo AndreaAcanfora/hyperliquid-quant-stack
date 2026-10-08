@@ -1,10 +1,10 @@
-# @andreaacanfora/trend-ensemble
+# @andreaaca/trend-ensemble
 
 A daily time-series-momentum ensemble for crypto perps, with a backtester that runs in Node or the
 browser and a paper-trading runner.
 
 ```bash
-npm i @andreaacanfora/trend-ensemble
+npm i @andreaaca/trend-ensemble
 ```
 
 ## The rule (no fitted parameters)
@@ -16,7 +16,7 @@ npm i @andreaacanfora/trend-ensemble
 ## Use it
 
 ```ts
-import { DEFAULT_TREND_PARAMS, runBacktest, targetWeights } from '@andreaacanfora/trend-ensemble';
+import { DEFAULT_TREND_PARAMS, runBacktest, targetWeights } from '@andreaaca/trend-ensemble';
 
 const { points, stats } = runBacktest(
   { days, closes: { BTC: btcCloses, ETH: ethCloses } }, // null for missing days
@@ -28,7 +28,7 @@ console.log(stats.cagr, stats.sharpe, stats.maxDrawdown);
 const weights = targetWeights({ BTC: btcCloses, ETH: ethCloses }, DEFAULT_TREND_PARAMS);
 ```
 
-`@andreaacanfora/trend-ensemble/shadow` (Node only) runs the strategy on a virtual book against live
+`@andreaaca/trend-ensemble/shadow` (Node only) runs the strategy on a virtual book against live
 Hyperliquid prices, charging fees and funding, and logs every day to JSONL.
 
 The backtester reproduces the Python research engine (`research/` in the repo) to 1e-10 on real

@@ -55,14 +55,14 @@ export default function Home() {
         </p>
         <div className="mt-6 grid gap-6 md:grid-cols-2">
           <Package
-            name="@andreaacanfora/hl-exec"
+            name="@andreaaca/hl-exec"
             body="Order execution for Hyperliquid perps: maker-first ladders, partial-fill-safe closes, native stop-loss and take-profit, fee and funding accounting, sub-accounts."
             code={`const hl = new HyperliquidExecutor({ credentials });
 await hl.connect();
 await hl.openLong('ETH-USD', 500, 'trend entry');`}
           />
           <Package
-            name="@andreaacanfora/trend-ensemble"
+            name="@andreaaca/trend-ensemble"
             body="Target weights, a backtester that runs in Node or a Web Worker, and a paper-trading runner. Matches the Python research engine to ten decimals."
             code={`const { stats } = runBacktest(series, DEFAULT_TREND_PARAMS);
 console.log(stats.sharpe, stats.maxDrawdown);`}

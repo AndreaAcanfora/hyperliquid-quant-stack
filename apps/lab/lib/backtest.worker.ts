@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 // Runs the trend-ensemble backtest off the main thread so the sliders stay
 // responsive while ~2,000 days x 13 coins are simulated.
-import { runBacktest } from "@andreaacanfora/trend-ensemble";
+import { runBacktest } from "@andreaaca/trend-ensemble";
 import { toParams, type CurvePoint, type WorkerRequest, type WorkerResponse } from "./lab";
 
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {

@@ -13,8 +13,8 @@ backtest that was off by a factor of fourteen.
 | Path | What it is |
 |---|---|
 | [`apps/lab`](apps/lab) | Next.js app. Strategy Lab (backtest in a Web Worker, shareable URL state), position map, an animated replay of how orders get filled, and the case study below. |
-| [`packages/hl-exec`](packages/hl-exec) | `@andreaacanfora/hl-exec`: production order execution for Hyperliquid perps. 61 tests. |
-| [`packages/trend-ensemble`](packages/trend-ensemble) | `@andreaacanfora/trend-ensemble`: target weights, a backtester that runs anywhere, and a paper-trading runner. Matches the Python research engine to 1e-10. |
+| [`packages/hl-exec`](packages/hl-exec) | `@andreaaca/hl-exec`: production order execution for Hyperliquid perps. 61 tests. |
+| [`packages/trend-ensemble`](packages/trend-ensemble) | `@andreaaca/trend-ensemble`: target weights, a backtester that runs anywhere, and a paper-trading runner. Matches the Python research engine to 1e-10. |
 | [`research`](research) | The Python robustness study the strategy's parameters come from. |
 
 The live bot imports both packages from npm, so the code here is the code that trades.
@@ -68,8 +68,8 @@ python3 research/trend_ensemble_backtest.py   # the research report (needs numpy
 ```
 
 ```ts
-import { HyperliquidExecutor } from '@andreaacanfora/hl-exec';
-import { DEFAULT_TREND_PARAMS, runBacktest } from '@andreaacanfora/trend-ensemble';
+import { HyperliquidExecutor } from '@andreaaca/hl-exec';
+import { DEFAULT_TREND_PARAMS, runBacktest } from '@andreaaca/trend-ensemble';
 ```
 
 ## What's not here

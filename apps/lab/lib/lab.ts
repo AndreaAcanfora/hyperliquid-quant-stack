@@ -1,4 +1,4 @@
-import type { BacktestStats, TrendEnsembleParams } from "@andreaacanfora/trend-ensemble";
+import type { BacktestStats, TrendEnsembleParams } from "@andreaaca/trend-ensemble";
 
 /** public/data/daily.json, written by scripts/fetch-data.mjs at build time. */
 export interface DailyData {

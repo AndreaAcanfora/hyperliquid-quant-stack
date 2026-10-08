@@ -1,5 +1,5 @@
 {
-  "name": "@andreaacanfora/trend-ensemble",
+  "name": "@andreaaca/trend-ensemble",
   "version": "0.1.0",
   "description": "Daily time-series-momentum ensemble: target-weight math, a portfolio backtester that runs in Node or the browser, and a shadow (paper) runner.",
   "license": "MIT",

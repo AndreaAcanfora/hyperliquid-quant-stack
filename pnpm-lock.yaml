@@ -17,7 +17,7 @@ importers:
 
   apps/lab:
     dependencies:
-      '@andreaacanfora/trend-ensemble':
+      '@andreaaca/trend-ensemble':
         specifier: workspace:*
         version: link:../../packages/trend-ensemble
       d3-array:

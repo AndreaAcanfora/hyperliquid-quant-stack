@@ -1,13 +1,13 @@
-# @andreaacanfora/hl-exec
+# @andreaaca/hl-exec
 
 Production order execution for Hyperliquid perpetuals, extracted from a bot that trades with real money.
 
 ```bash
-npm i @andreaacanfora/hl-exec
+npm i @andreaaca/hl-exec
 ```
 
 ```ts
-import { CloseFailedError, HyperliquidExecutor } from '@andreaacanfora/hl-exec';
+import { CloseFailedError, HyperliquidExecutor } from '@andreaaca/hl-exec';
 
 const hl = new HyperliquidExecutor({
   credentials: {
