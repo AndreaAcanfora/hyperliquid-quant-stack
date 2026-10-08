@@ -1,0 +1,33 @@
+{
+  "name": "@andreaacanfora/hl-exec",
+  "version": "0.1.0",
+  "description": "Production order execution for Hyperliquid perps: maker-first ladders, partial-fill-safe closes, native TP/SL, fill and funding accounting.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "repository": { "type": "git", "url": "https://github.com/AndreaAcanfora/hyperliquid-quant-stack", "directory": "packages/hl-exec" },
+  "keywords": ["hyperliquid", "trading", "perpetuals", "execution", "market-making"],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "peerDependencies": {},
+  "dependencies": {
+    "@nktkas/hyperliquid": "^0.32.2",
+    "viem": "^2.50.4"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "@types/node": "^22.15.0"
+  }
+}
