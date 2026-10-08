@@ -1,12 +1,12 @@
 /**
- * Tests for src/shadow.ts (v8 shadow runner).
+ * Tests for src/shadow.ts (paper runner).
  */
 import assert from 'node:assert/strict';
 import { describe, test } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runShadowDay, type ShadowClient } from '../src/shadow.js';
+import { DEFAULT_UNIVERSE, runShadowDay, type ShadowClient } from '../src/shadow.js';
 
 
 const DAY = 86_400_000;
@@ -34,7 +34,7 @@ function makeClient(series: Record<string, (i: number) => number>, now: () => nu
 describe('runShadowDay', () => {
 
 test('buys the uptrending coin, skips the downtrend, persists state and logs', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'v8s-'));
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-'));
   let now = T0;
   // UP: steady +0.5%/day with small noise; DOWN: mirror.
   const up = (i: number) => 100 * Math.pow(1.005, i) * (1 + (i % 2 ? 0.01 : -0.01));
@@ -52,7 +52,7 @@ test('buys the uptrending coin, skips the downtrend, persists state and logs', a
   assert.equal(state.lastRunDay, '2026-09-25');
   assert.ok(existsSync(join(dir, 'trades.jsonl')) && existsSync(join(dir, 'daily.jsonl')));
   assert.equal(reports.length, 1);
-  assert.match(reports[0]!, /v8 shadow \(no real orders\)/);
+  assert.match(reports[0]!, /shadow \(no real orders\)/);
 
   // Same day again -> no-op; next day with UP collapsing -> sells to flat.
   assert.equal(await runShadowDay({ client, dir, capital: 1000, universe: ['UP', 'DOWN'], now: () => now }), null);
@@ -66,14 +66,14 @@ test('buys the uptrending coin, skips the downtrend, persists state and logs', a
 });
 
 test('waits until 10 minutes after the UTC close', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'v8s-'));
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-'));
   const now = Date.parse('2026-09-25T00:05:00Z');
   const client = makeClient({ UP: (i) => 100 + i }, () => now, { UP: 200 });
   assert.equal(await runShadowDay({ client, dir, capital: 1000, universe: ['UP'], now: () => now }), null);
 });
 
 test('skips the day instead of trading when a held coin has no price', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'v8s-'));
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-'));
   let now = T0;
   const up = (i: number) => 100 * Math.pow(1.005, i) * (1 + (i % 2 ? 0.01 : -0.01));
   await runShadowDay({ client: makeClient({ UP: up }, () => now, { UP: 180 }), dir, capital: 1000, universe: ['UP'], now: () => now });
@@ -85,7 +85,7 @@ test('skips the day instead of trading when a held coin has no price', async () 
 });
 
 test('charges funding on the held book since the previous run (longs pay positive rates)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'v8s-'));
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-'));
   let now = T0;
   const up = (i: number) => 100 * Math.pow(1.005, i) * (1 + (i % 2 ? 0.01 : -0.01));
   const base = makeClient({ UP: up }, () => now, { UP: 180 });
@@ -104,5 +104,26 @@ test('charges funding on the held book since the previous run (longs pay positiv
   assert.deepEqual(window, [T0, T0 + DAY], 'accrual window = previous run -> now');
   const s2 = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
   assert.ok(Math.abs(s2.fundingPaid - expected) < 1e-9);
+});
+
+test('resumes a book written by an older release and uses the label', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-'));
+  writeFileSync(join(dir, 'state.json'), JSON.stringify({
+    version: 'v8-shadow-1', startedAt: '2026-09-01T00:00:00.000Z', capitalStart: 500,
+    cash: 500, positions: {}, feesPaid: 0, lastRunDay: '2026-09-24',
+  }));
+  const up = (i: number) => 100 * Math.pow(1.005, i) * (1 + (i % 2 ? 0.01 : -0.01));
+  const client = makeClient({ UP: up }, () => T0, { UP: 180 });
+  const logs: string[] = [];
+  const reports: string[] = [];
+  const r = await runShadowDay({
+    client, dir, capital: 1000, universe: ['UP'], now: () => T0, label: 'paper',
+    log: (_l, m) => { logs.push(m); }, report: async (t) => { reports.push(t); },
+  });
+  assert.ok(r);
+  assert.ok(r!.equityBefore === 500, 'kept the stored capital, not the new one');
+  assert.match(logs.at(-1)!, /^\[paper\] 2026-09-25/);
+  assert.match(reports[0]!, /^paper \(no real orders\)/);
+  assert.ok(DEFAULT_UNIVERSE.includes('BTC'));
 });
 });

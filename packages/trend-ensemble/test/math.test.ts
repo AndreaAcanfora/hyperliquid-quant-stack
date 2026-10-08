@@ -1,5 +1,5 @@
 /**
- * Tests for src/math.ts (pure v8 target math).
+ * Tests for src/math.ts (pure target math).
  */
 import assert from 'node:assert/strict';
 import { describe, test } from 'vitest';

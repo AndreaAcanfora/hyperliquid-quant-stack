@@ -1,22 +1,23 @@
 /**
- * v8 "Trend Ensemble" SHADOW runner: trades a virtual portfolio with the
- * live v8 rules on real Hyperliquid prices, places no orders.
+ * Trend Ensemble SHADOW runner: trades a virtual portfolio with the
+ * strategy rules on real Hyperliquid prices, places no orders.
  *
  * Once per UTC day, after the daily candle closes:
  *   1. fetch HL 1d candles for the universe (in-progress day dropped),
- *   2. compute target weights (src/strategies/trendEnsemble.ts, the same
- *      math as scripts/research/v8/trend_ensemble_backtest.py),
+ *   2. compute target weights (`targetWeights`, the same math as
+ *      research/trend_ensemble_backtest.py),
  *   3. mark the virtual book to the current HL mark price,
  *   4. simulate the band-filtered rebalance as taker fills
  *      (mark +/- slippage, taker fee),
  *   5. persist state + append the day's trades/snapshot to JSONL files,
- *   6. send a short Telegram report (daily-summary flag).
+ *   6. hand a short text report to `deps.report` (e.g. a Telegram message).
  *
  * Funding: at each run, every held position is charged the sum of HL's
  * hourly funding rates since the previous run times its notional at the
  * current mark (positive rate = longs pay), like the backtest does.
  *
- * State lives in `data/v8-shadow/` (gitignored, survives deploys):
+ * State lives in `deps.dir` (keep it outside the deploy tree so it
+ * survives redeploys):
  *   state.json   current book, rewritten atomically each day
  *   trades.jsonl one line per simulated fill
  *   daily.jsonl  one line per daily run (equity, gross, weights, orders)
@@ -30,7 +31,8 @@ import {
   type TrendEnsembleParams,
 } from './math.js';
 
-export const V8_UNIVERSE = [
+/** The 13 liquid Hyperliquid perps the strategy was researched on. */
+export const DEFAULT_UNIVERSE = [
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'LINK', 'AVAX', 'ADA', 'LTC', 'SUI', 'NEAR', 'HYPE',
 ] as const;
 
@@ -39,7 +41,8 @@ const TAKER_FEE = 0.00045;
 const SLIPPAGE = 0.0002;
 
 export interface ShadowState {
-  version: 'v8-shadow-1';
+  /** `v8-shadow-1` is the same schema, written by releases before 0.2. */
+  version: 'shadow-1' | 'v8-shadow-1';
   startedAt: string;
   capitalStart: number;
   /** Quote balance; negative when the book is levered (perp margin). */
@@ -85,6 +88,8 @@ export interface ShadowDeps {
   now?: () => number;
   log?: (level: 'info' | 'warning' | 'error', msg: string) => void;
   report?: (text: string) => Promise<void>;
+  /** Name used in log lines and the report title. Default `shadow`. */
+  label?: string;
 }
 
 const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
@@ -93,7 +98,7 @@ export function loadShadowState(dir: string, capital: number, nowMs: number): Sh
   const file = join(dir, 'state.json');
   if (existsSync(file)) return JSON.parse(readFileSync(file, 'utf8')) as ShadowState;
   return {
-    version: 'v8-shadow-1',
+    version: 'shadow-1',
     startedAt: new Date(nowMs).toISOString(),
     capitalStart: capital,
     cash: capital,
@@ -126,7 +131,8 @@ export async function runShadowDay(deps: ShadowDeps): Promise<ShadowDayResult | 
   const now = (deps.now ?? Date.now)();
   const log = deps.log ?? (() => undefined);
   const params = deps.params ?? DEFAULT_TREND_PARAMS;
-  const universe = deps.universe ?? V8_UNIVERSE;
+  const universe = deps.universe ?? DEFAULT_UNIVERSE;
+  const label = deps.label ?? 'shadow';
   mkdirSync(deps.dir, { recursive: true });
   const state = loadShadowState(deps.dir, deps.capital, now);
   const day = utcDay(now);
@@ -148,7 +154,7 @@ export async function runShadowDay(deps: ShadowDeps): Promise<ShadowDayResult | 
       prices[coin] = px;
     } catch (err: unknown) {
       missing.push(coin);
-      log('warning', `[v8-shadow] ${coin}: ${err instanceof Error ? err.message : String(err)}`);
+      log('warning', `[${label}] ${coin}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   // A coin we hold but can't price: keep it untouched and mark it at its
@@ -156,7 +162,7 @@ export async function runShadowDay(deps: ShadowDeps): Promise<ShadowDayResult | 
   // rather than trading on a partial book.
   const heldWithoutPrice = Object.keys(state.positions).filter((c) => state.positions[c] !== 0 && !(c in prices));
   if (heldWithoutPrice.length > 0) {
-    log('error', `[v8-shadow] no price for held ${heldWithoutPrice.join(',')} - skipping ${day}`);
+    log('error', `[${label}] no price for held ${heldWithoutPrice.join(',')} - skipping ${day}`);
     return null;
   }
 
@@ -173,7 +179,7 @@ export async function runShadowDay(deps: ShadowDeps): Promise<ShadowDayResult | 
         const sumRate = rates.reduce((s, r) => s + r.rate, 0);
         funding += q * prices[coin]! * sumRate;
       } catch (err: unknown) {
-        log('warning', `[v8-shadow] funding ${coin}: ${err instanceof Error ? err.message : String(err)}`);
+        log('warning', `[${label}] funding ${coin}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     state.cash -= funding;
@@ -217,12 +223,12 @@ export async function runShadowDay(deps: ShadowDeps): Promise<ShadowDayResult | 
   if (fills.length > 0) appendFileSync(join(deps.dir, 'trades.jsonl'), fills.join('\n') + '\n');
   const result: ShadowDayResult = { day, equity, equityBefore, gross, funding, weights, orders, missing };
   appendFileSync(join(deps.dir, 'daily.jsonl'), JSON.stringify({ ...result, t: new Date(now).toISOString(), feesPaid: state.feesPaid, fundingPaid: state.fundingPaid ?? 0 }) + '\n');
-  log('info', `[v8-shadow] ${day} equity=$${equity.toFixed(2)} gross=${gross.toFixed(2)}x orders=${orders.length}${missing.length ? ` missing=${missing.join(',')}` : ''}`);
+  log('info', `[${label}] ${day} equity=$${equity.toFixed(2)} gross=${gross.toFixed(2)}x orders=${orders.length}${missing.length ? ` missing=${missing.join(',')}` : ''}`);
 
   if (deps.report) {
     const pnl = equity - state.capitalStart;
     const lines = [
-      `v8 shadow (no real orders) - ${day}`,
+      `${label} (no real orders) - ${day}`,
       `Equity $${equity.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}, ${((equity / state.capitalStart - 1) * 100).toFixed(2)}% since ${state.startedAt.slice(0, 10)})`,
       `Exposure ${gross.toFixed(2)}x, fees so far $${state.feesPaid.toFixed(2)}, funding so far $${(state.fundingPaid ?? 0).toFixed(2)}${funding !== 0 ? ` (today ${funding >= 0 ? '-' : '+'}$${Math.abs(funding).toFixed(2)})` : ''}`,
       orders.length === 0
@@ -232,7 +238,7 @@ export async function runShadowDay(deps: ShadowDeps): Promise<ShadowDayResult | 
     try {
       await deps.report(lines.join('\n'));
     } catch (err: unknown) {
-      log('warning', `[v8-shadow] report failed: ${err instanceof Error ? err.message : String(err)}`);
+      log('warning', `[${label}] report failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return result;
