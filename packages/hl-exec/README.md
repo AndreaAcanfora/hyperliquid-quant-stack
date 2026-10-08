@@ -15,7 +15,8 @@ const hl = new HyperliquidExecutor({
     accountAddress: process.env.HL_ACCOUNT!,
     // vaultAddress: '0x…'                         // trade a sub-account instead
   },
-  makerWaitMs: 240_000, // maker ladder before the taker fallback
+  makerWaitMs: 240_000, // total time on the maker ladder before the taker fallback
+  makerSteps: 3,         // post-only reposts, one tick more aggressive each
   crossLeverage: 5,
   logger: { log: (level, msg) => console.log(level, msg) },
 });
@@ -31,6 +32,23 @@ try {
   }
 }
 ```
+
+## Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `credentials` | none | `{ agentPrivateKey, accountAddress, vaultAddress? }`; or pass them to `connectWithCredentials()` later. |
+| `testnet` | `false` | Use the Hyperliquid testnet. |
+| `makerWaitMs` | `240000` | Total time on the maker ladder, split evenly across steps. |
+| `makerSteps` | `3` | Number of post-only reposts before the taker fallback. |
+| `makerPollMs` | `3000` | How often the position is read while an order rests. |
+| `crossLeverage` | `5` | Cross leverage set once per coin before the first order. |
+| `logger` | silent | `{ log(level, message) }`. |
+| `orderStateSink` | none | Receives in-flight maker state, e.g. to lock a UI button. |
+
+Fee rates, buffers and thresholds are exported as `constants` (`HL_MAKER_FEE_RATE`, `HL_TAKER_FEE_RATE`, ...). The pure helpers the executor is built on are exported too: `stepPrice`, `priceTick`, `formatPrice`, `formatSize`, `toMarket`, `toInterval`, `aggregateFills`, `mergeTradeResults`.
+
+`getCandles(market, resolution, limit)` returns typed `Candle` objects (`startedAt`, `open`, `high`, `low`, `close`, `volume`, `trades`) with numeric prices.
 
 ## Behaviour
 
