@@ -15,12 +15,12 @@ import { join } from 'node:path';
 const root = join(import.meta.dirname, '..');
 const run = (cmd, args, cwd = root) => execFileSync(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'inherit'] }).toString().trim();
 
-function isPublished(name, version) {
-  try {
-    return run('npm', ['view', `${name}@${version}`, 'version']) === version;
-  } catch {
-    return false; // E404: never published
-  }
+/** Asks the registry directly, so a missing version is a quiet 404, not an npm error log. */
+async function isPublished(name, version) {
+  const res = await fetch(`https://registry.npmjs.org/${name.replace('/', '%2f')}/${version}`);
+  if (res.status === 404) return false;
+  if (!res.ok) throw new Error(`registry lookup ${name}@${version}: HTTP ${res.status}`);
+  return true;
 }
 
 let published = 0;
@@ -28,7 +28,7 @@ for (const dir of readdirSync(join(root, 'packages'))) {
   const cwd = join(root, 'packages', dir);
   const { name, version, private: isPrivate } = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
   if (isPrivate) continue;
-  if (isPublished(name, version)) {
+  if (await isPublished(name, version)) {
     console.log(`${name}@${version} already on npm`);
     continue;
   }
