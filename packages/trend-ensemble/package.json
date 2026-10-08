@@ -7,13 +7,33 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./shadow": { "types": "./dist/shadow.d.ts", "import": "./dist/shadow.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./shadow": {
+      "types": "./dist/shadow.d.ts",
+      "import": "./dist/shadow.js"
+    }
   },
-  "files": ["dist", "README.md", "CHANGELOG.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "sideEffects": false,
-  "repository": { "type": "git", "url": "https://github.com/AndreaAcanfora/hyperliquid-quant-stack", "directory": "packages/trend-ensemble" },
-  "keywords": ["trend-following", "momentum", "backtest", "quant", "crypto"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndreaAcanfora/hyperliquid-quant-stack.git",
+    "directory": "packages/trend-ensemble"
+  },
+  "keywords": [
+    "trend-following",
+    "momentum",
+    "backtest",
+    "quant",
+    "crypto"
+  ],
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
