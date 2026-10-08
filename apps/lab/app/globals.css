@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@theme {
+  --color-paper: #f6f8fa;
+  --color-grid: #d9e3ee;
+  --color-grid-strong: #bccbdc;
+  --color-ink: #18233d;
+  --color-ink-soft: #4a5672;
+  --color-ink-faint: #7d879c;
+  --color-gain: #1c7a52;
+  --color-loss: #c2381f;
+  --color-marker: #f1d54a;
+
+  --font-display: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-plex), ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Engineering graph paper: 8px minor, 40px major lines. */
+.graph-paper {
+  background-color: var(--color-paper);
+  background-image:
+    linear-gradient(var(--color-grid-strong) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-grid-strong) 1px, transparent 1px),
+    linear-gradient(var(--color-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-grid) 1px, transparent 1px);
+  background-size: 40px 40px, 40px 40px, 8px 8px, 8px 8px;
+  background-position: -1px -1px;
+}
+
+:focus-visible {
+  outline: 3px solid var(--color-marker);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+input[type="range"] {
+  accent-color: var(--color-ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
