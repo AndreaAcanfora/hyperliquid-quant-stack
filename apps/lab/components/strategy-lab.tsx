@@ -34,7 +34,7 @@ export function StrategyLab() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate from the shared URL once
     setSettings(parseSettings(window.location.search));
-    fetch("/data/daily.json")
+    fetch("/api/daily")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(setData)
       .catch((e: unknown) => setError(`Price data could not be loaded (${e instanceof Error ? e.message : e}). Reload the page to try again.`));
