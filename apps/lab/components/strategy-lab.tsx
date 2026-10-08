@@ -10,39 +10,15 @@ import {
   type LabSettings,
   type WorkerResponse,
 } from "@/lib/lab";
+import { parseSettings, serializeSettings } from "@/lib/url-state";
 import { RecorderChart } from "./recorder-chart";
 import { PositionsMap } from "./positions-map";
 
 const ALL_COINS = DEFAULT_SETTINGS.coins;
 const YEARS = [2021, 2022, 2023, 2024, 2025, 2026];
 
-/** Settings <-> URL query, so a configuration can be shared as a link. */
-function readUrl(): LabSettings {
-  if (typeof window === "undefined") return DEFAULT_SETTINGS;
-  const q = new URLSearchParams(window.location.search);
-  const num = (k: string, d: number) => (q.has(k) && Number.isFinite(Number(q.get(k))) ? Number(q.get(k)) : d);
-  const coins = q.get("coins")?.split(",").filter((c) => ALL_COINS.includes(c));
-  return {
-    horizon: num("h", DEFAULT_SETTINGS.horizon),
-    volTarget: num("vol", DEFAULT_SETTINGS.volTarget),
-    grossCap: num("cap", DEFAULT_SETTINGS.grossCap),
-    band: num("band", DEFAULT_SETTINGS.band),
-    longOnly: q.get("shorts") !== "1",
-    coins: coins && coins.length > 0 ? coins : DEFAULT_SETTINGS.coins,
-    startYear: num("from", DEFAULT_SETTINGS.startYear),
-  };
-}
-
 function writeUrl(s: LabSettings) {
-  const q = new URLSearchParams();
-  if (s.horizon !== DEFAULT_SETTINGS.horizon) q.set("h", String(s.horizon));
-  if (s.volTarget !== DEFAULT_SETTINGS.volTarget) q.set("vol", String(s.volTarget));
-  if (s.grossCap !== DEFAULT_SETTINGS.grossCap) q.set("cap", String(s.grossCap));
-  if (s.band !== DEFAULT_SETTINGS.band) q.set("band", String(s.band));
-  if (!s.longOnly) q.set("shorts", "1");
-  if (s.coins.length !== ALL_COINS.length) q.set("coins", s.coins.join(","));
-  if (s.startYear !== DEFAULT_SETTINGS.startYear) q.set("from", String(s.startYear));
-  const qs = q.toString();
+  const qs = serializeSettings(s);
   window.history.replaceState(null, "", qs ? `?${qs}#lab` : window.location.pathname + window.location.hash);
 }
 
@@ -57,8 +33,8 @@ export function StrategyLab() {
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate from the shared URL once
-    setSettings(readUrl());
-    fetch("/data/daily.json")
+    setSettings(parseSettings(window.location.search));
+    fetch("/api/daily")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(setData)
       .catch((e: unknown) => setError(`Price data could not be loaded (${e instanceof Error ? e.message : e}). Reload the page to try again.`));

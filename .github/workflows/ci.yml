@@ -21,3 +21,24 @@ jobs:
       - run: pnpm -r typecheck
       - run: pnpm -r lint
       - run: pnpm -r test
+
+  lab-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter './packages/*' build
+      - run: pnpm --filter lab exec playwright install --with-deps chromium
+      - run: pnpm --filter lab test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: apps/lab/test-results
+          retention-days: 7

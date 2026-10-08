@@ -1,6 +1,7 @@
 import type { BacktestStats, TrendEnsembleParams } from "@andreaaca/trend-ensemble";
+import { UNIVERSE } from "./daily-data";
 
-/** public/data/daily.json, written by scripts/fetch-data.mjs at build time. */
+/** Served by /api/daily (lib/daily-data.ts), refreshed hourly. */
 export interface DailyData {
   updatedAt: string;
   days: number[];
@@ -30,7 +31,7 @@ export const DEFAULT_SETTINGS: LabSettings = {
   grossCap: 1.5,
   band: 0.2,
   longOnly: true,
-  coins: ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "LINK", "AVAX", "ADA", "LTC", "SUI", "NEAR", "HYPE"],
+  coins: [...UNIVERSE],
   startYear: 2021,
 };
 

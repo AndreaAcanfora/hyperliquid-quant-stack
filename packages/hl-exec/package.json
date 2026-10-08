@@ -9,7 +9,7 @@
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "CHANGELOG.md"],
   "sideEffects": false,
   "repository": { "type": "git", "url": "https://github.com/AndreaAcanfora/hyperliquid-quant-stack", "directory": "packages/hl-exec" },
   "keywords": ["hyperliquid", "trading", "perpetuals", "execution", "market-making"],

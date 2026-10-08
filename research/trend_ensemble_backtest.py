@@ -1,5 +1,5 @@
 #!/usr/bin/env python3 -u
-"""v8 "Trend Ensemble" research backtest.
+"""Trend Ensemble research backtest.
 
 Strategy (fixed, textbook parameters - NOTHING is optimized):
   score_i  = mean over L in LOOKBACKS of sign(close_t / close_{t-L} - 1)
@@ -21,7 +21,7 @@ Data (cached under data/cache/, gitignored):
 Usage:
   python3 research/trend_ensemble_backtest.py            # full report
   python3 research/trend_ensemble_backtest.py --refresh  # re-download data
-Output: printed report + data/v8/report.json
+Output: printed report + data/cache/report.json
 """
 import argparse, json, math, os, time, urllib.request
 from pathlib import Path
@@ -205,10 +205,10 @@ def main():
         return s
 
     print("\n== Base ==")
-    run("v8 base (13 coins)")
-    run("v8 base, maker fees", fee=0.00015 + 0.0001)
-    run("v8 base, costs x2", fee=BASE["fee"] * 2)
-    run("v8 long/short", long_only=False)
+    run("base (13 coins)")
+    run("base, maker fees", fee=0.00015 + 0.0001)
+    run("base, costs x2", fee=BASE["fee"] * 2)
+    run("long/short", long_only=False)
 
     print("\n== Leverage / risk ==")
     for vt, cap in [(0.4, 1.0), (0.6, 1.5), (0.8, 2.0)]:

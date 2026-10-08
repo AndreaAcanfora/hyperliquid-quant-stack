@@ -9,3 +9,8 @@ coverage/
 .DS_Store
 data/cache/
 *.tsbuildinfo
+.vercel
+
+# Playwright
+test-results/
+playwright-report/

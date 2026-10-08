@@ -1,7 +1,7 @@
 /**
- * v8 "Trend Ensemble": pure target-weight math, no I/O.
+ * Trend Ensemble: pure target-weight math, no I/O.
  *
- * Mirrors `scripts/research/v8/trend_ensemble_backtest.py` exactly so
+ * Mirrors `research/trend_ensemble_backtest.py` exactly so
  * the live runner trades what was backtested:
  *
  *   score_i  = mean over L in lookbacks of sign(close_t / close_{t-L} - 1)

@@ -181,6 +181,19 @@ export interface OrderStateValue {
   oid?: number;             // HL order id of the resting limit
 }
 
+/** One OHLCV candle; `startedAt` is the bar's open time (ISO 8601, UTC). */
+export interface Candle {
+  startedAt: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** Volume in base units. */
+  volume: number;
+  /** Number of trades in the bar. */
+  trades: number;
+}
+
 export interface ExchangeClient {
   /**
    * User ID (cuid) on whose behalf this client signs. `null` when
@@ -230,7 +243,7 @@ export interface ExchangeClient {
     goodTilSec: number,
   ): Promise<void>;
 
-  getCandles(market: string, resolution?: string, limit?: number): Promise<unknown[]>;
+  getCandles(market: string, resolution?: string, limit?: number): Promise<Candle[]>;
 
   /**
    * Look up the fills for a given order id. Used right after open/close

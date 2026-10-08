@@ -83,7 +83,8 @@ function Package({ name, body, code }: { name: string; body: string; code: strin
     <div className="border-t-2 border-ink pt-4">
       <h3 className="font-display text-lg font-semibold">{name}</h3>
       <p className="mt-2 text-ink-soft">{body}</p>
-      <pre className="mt-4 overflow-x-auto rounded-sm bg-ink p-4 text-sm leading-relaxed text-paper">
+      {/* Focusable so keyboard users can scroll long lines. */}
+      <pre tabIndex={0} aria-label={`${name} example`} className="mt-4 overflow-x-auto rounded-sm bg-ink p-4 text-sm leading-relaxed text-paper">
         <code>{`npm i ${name}\n\n${code}`}</code>
       </pre>
     </div>

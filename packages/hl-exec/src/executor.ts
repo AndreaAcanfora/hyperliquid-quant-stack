@@ -22,7 +22,14 @@
  */
 import * as hl from '@nktkas/hyperliquid';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
+import { CLOSE_IOC_ATTEMPTS, DUST_NOTIONAL_USD, HL_MAKER_FEE_RATE, HL_TAKER_FEE_RATE, MAKER_FILLED_SHARE, NO_BOOK_SLIPPAGE, TAKER_CROSS_BUFFER } from './constants.js';
+import { CloseFailedError } from './errors.js';
+import { aggregateFills, mergeTradeResults, normalizeFill } from './fills.js';
+import { coinOf, intervalMs, toInterval, toMarket } from './markets.js';
+import { SILENT_LOGGER, type ExecutorCredentials, type ExecutorLogger, type ExecutorOptions, type OrderStateSink } from './options.js';
+import { formatPrice, formatSize, stepPrice, type BestBidOffer } from './pricing.js';
 import type {
+  Candle,
   ExchangeClient,
   ExchangeBalance,
   ExchangePositionInfo,
@@ -34,242 +41,6 @@ import type {
   OrderStateValue,
   TpSlOrders,
 } from './types.js';
-
-/** Minimal logger; the bot passes its own, the default is silent. */
-export interface ExecutorLogger {
-  log(level: 'info' | 'warning' | 'error', message: string): void;
-}
-
-/**
- * Optional sink for in-flight maker order state (e.g. a cache key a UI
- * reads to lock a manual "close" button). Failures must not throw.
- */
-export interface OrderStateSink {
-  publish(namespace: string, market: string, value: OrderStateValue, ttlSec: number): Promise<void>;
-  clear(namespace: string, market: string): Promise<void>;
-}
-
-export interface ExecutorCredentials {
-  /** Agent wallet private key (0x + 64 hex), approved by the account. */
-  agentPrivateKey: string;
-  /** Account (master) address the agent trades for (0x + 40 hex). */
-  accountAddress: string;
-  /** Sub-account to trade and query instead of the master account. */
-  vaultAddress?: string;
-}
-
-export interface ExecutorOptions {
-  /** Use HL testnet endpoints. Default false (mainnet). */
-  testnet?: boolean;
-  logger?: ExecutorLogger;
-  orderStateSink?: OrderStateSink;
-  /** Total maker-ladder wait before the taker fallback. Default 240s. */
-  makerWaitMs?: number;
-  /** Cross leverage set once per coin before its first entry. Default 5. */
-  crossLeverage?: number;
-  /** Credentials used by `connect()`; or call `connectWithCredentials`. */
-  credentials?: ExecutorCredentials;
-}
-
-const SILENT: ExecutorLogger = { log: () => undefined };
-
-// HL fee tiers: maker 0.020% (Alo), taker 0.045% (Ioc/FrontendMarket).
-const HL_MAKER_FEE_RATE = 0.0002;
-const HL_TAKER_FEE_RATE = 0.00045;
-
-// `ETH-USD` → HL-native coin. Callers pass `ETH-USD`; the HL SDK wants the bare coin (`ETH`, `SOL`, `BNB`, ...).
-function stripUsdSuffix(market: string): string {
-  return market.replace(/-USD$/, '');
-}
-
-// Spot-style symbols accepted as aliases for `<COIN>-USD` markets.
-const SYMBOL_TO_MARKET: Record<string, string> = {
-  ETHUSDC: 'ETH-USD',
-  ETHUSDT: 'ETH-USD',
-  SOLUSDC: 'SOL-USD',
-  SOLUSDT: 'SOL-USD',
-  BNBUSDC: 'BNB-USD',
-  BNBUSDT: 'BNB-USD',
-  BTCUSDC: 'BTC-USD',
-  BTCUSDT: 'BTC-USD',
-};
-
-// Resolution names (`4HOURS`, `1DAY`, ...) → HL `candleSnapshot` interval.
-const RESOLUTION_MAP: Record<string, hl.CandleSnapshotParameters['interval']> = {
-  '1MIN': '1m',
-  '5MINS': '5m',
-  '15MINS': '15m',
-  '30MINS': '30m',
-  '1HOUR': '1h',
-  '2HOURS': '2h',
-  '4HOURS': '4h',
-  '1DAY': '1d',
-};
-
-/**
- * Thrown by `closePosition` when the venue did not flatten the caller's
- * share: the IOC was rejected / returned nothing / only partially
- * filled after every retry. Distinct from the `null` return, which
- * means "stale local state, nothing to close" and is safe to clear.
- * On this error the position is STILL OPEN, so the caller must keep
- * its local record (and its TP/SL) and retry later.
- */
-export class CloseFailedError extends Error {
-  readonly filledSize: number;
-  readonly remainingSize: number;
-  constructor(message: string, filledSize: number, remainingSize: number) {
-    super(message);
-    this.name = 'CloseFailedError';
-    this.filledSize = filledSize;
-    this.remainingSize = remainingSize;
-  }
-}
-
-// Remainders worth less than this (USD) are treated as fully filled:
-// HL rounding dust that no order can express.
-const DUST_NOTIONAL_USD = 1;
-const CLOSE_IOC_ATTEMPTS = 3;
-
-function resolutionToInterval(res: string): hl.CandleSnapshotParameters['interval'] {
-  return RESOLUTION_MAP[res] ?? '4h';
-}
-
-/**
- * Coerce HL's stringly-typed fill record into the bot's `OrderFill`. HL
- * encodes numbers as strings to avoid float-precision drift on the
- * wire; we parse here once. Anything that fails coercion is silently
- * coerced to 0 / "" — never throws (these helpers are called inside the
- * trading loop and must not crash the runner on a malformed fill).
- */
-function normalizeHlFill(raw: {
-  oid: number;
-  px: string;
-  sz: string;
-  side: 'B' | 'A';
-  fee: string;
-  closedPnl: string;
-  crossed: boolean;
-  time: number;
-  hash: string;
-  coin?: string;
-}): OrderFill {
-  return {
-    oid: raw.oid,
-    px: Number(raw.px) || 0,
-    sz: Number(raw.sz) || 0,
-    side: raw.side,
-    fee: Number(raw.fee) || 0,
-    closedPnl: Number(raw.closedPnl) || 0,
-    crossed: !!raw.crossed,
-    time: raw.time,
-    hash: raw.hash ?? '',
-    ...(raw.coin ? { coin: raw.coin } : {}),
-  };
-}
-
-/**
- * Aggregate one or more fills for a single order id into a summary
- * suitable for `ExchangeTradeResult` / trade logging.
- *
- * Returns null on empty input so the caller can distinguish "no fills
- * yet" from "this order had ~0 size" (we always pass ≥1 fill in
- * production, but keep the guard for tests).
- */
-function aggregateOrderFills(
-  oid: number,
-  rawFills: Array<{
-    oid: number;
-    px: string;
-    sz: string;
-    side: 'B' | 'A';
-    fee: string;
-    closedPnl: string;
-    crossed: boolean;
-    time: number;
-    hash: string;
-    coin?: string;
-  }>,
-): OrderFillsAggregate | null {
-  if (rawFills.length === 0) return null;
-  const fills = rawFills.map(normalizeHlFill);
-  let totalSize = 0;
-  let totalNotional = 0; // Σ(px × sz) for weighted average
-  let totalFee = 0;
-  let totalClosedPnl = 0;
-  let wasTaker = false;
-  let firstFillTime = Number.POSITIVE_INFINITY;
-  let lastFillTime = 0;
-  const hashSet = new Set<string>();
-  for (const f of fills) {
-    totalSize += f.sz;
-    totalNotional += f.px * f.sz;
-    totalFee += f.fee;
-    totalClosedPnl += f.closedPnl;
-    if (f.crossed) wasTaker = true;
-    if (f.time < firstFillTime) firstFillTime = f.time;
-    if (f.time > lastFillTime) lastFillTime = f.time;
-    if (f.hash) hashSet.add(f.hash);
-  }
-  return {
-    oid,
-    fills,
-    totalSize,
-    avgPrice: totalSize > 0 ? totalNotional / totalSize : 0,
-    totalFee,
-    totalClosedPnl,
-    wasTaker,
-    firstFillTime: firstFillTime === Number.POSITIVE_INFINITY ? 0 : firstFillTime,
-    lastFillTime,
-    txHashes: Array.from(hashSet),
-  };
-}
-
-/**
- * Collapse the orders of one close (maker ladder + taker remainder) into
- * a single result: summed size and fee, size-weighted price, and the
- * last order's id (the runner's fill sweep aggregates across oids).
- */
-function mergeTradeResults(
-  results: ExchangeTradeResult[],
-  market: string,
-  side: 'BUY' | 'SELL',
-  reason: string,
-): ExchangeTradeResult | null {
-  if (results.length === 0) return null;
-  if (results.length === 1) return results[0] ?? null;
-  const size = results.reduce((s, r) => s + r.size, 0);
-  const notional = results.reduce((s, r) => s + r.size * r.price, 0);
-  const last = results[results.length - 1];
-  return {
-    orderId: last?.orderId ?? 0,
-    market,
-    side,
-    size,
-    price: size > 0 ? notional / size : (last?.price ?? 0),
-    fee: results.reduce((s, r) => s + r.fee, 0),
-    reason,
-    timestamp: new Date().toISOString(),
-  };
-}
-
-function intervalToMs(interval: hl.CandleSnapshotParameters['interval']): number {
-  switch (interval) {
-    case '1m': return 60_000;
-    case '3m': return 180_000;
-    case '5m': return 300_000;
-    case '15m': return 900_000;
-    case '30m': return 1_800_000;
-    case '1h': return 3_600_000;
-    case '2h': return 7_200_000;
-    case '4h': return 14_400_000;
-    case '8h': return 28_800_000;
-    case '12h': return 43_200_000;
-    case '1d': return 86_400_000;
-    case '3d': return 259_200_000;
-    case '1w': return 604_800_000;
-    case '1M': return 2_592_000_000;
-  }
-}
 
 // Loose shape of one entry inside `clearinghouseState.assetPositions`.
 type RawAssetPosition = {
@@ -288,17 +59,20 @@ export class HyperliquidExecutor implements ExchangeClient {
   private readonly defaultCredentials: ExecutorCredentials | null;
 
   constructor(options: ExecutorOptions = {}) {
-    this.logger = options.logger ?? SILENT;
+    this.logger = options.logger ?? SILENT_LOGGER;
     this.testnet = options.testnet ?? false;
     this.orderStateSink = options.orderStateSink ?? null;
     this.defaultCredentials = options.credentials ?? null;
-    if (options.makerWaitMs !== undefined) this.makerCloseMaxWaitMs = options.makerWaitMs;
+    if (options.makerWaitMs !== undefined) this.makerWaitMs = options.makerWaitMs;
+    if (options.makerPollMs !== undefined) this.makerPollMs = options.makerPollMs;
+    if (options.makerSteps !== undefined) this.makerSteps = options.makerSteps;
     if (options.crossLeverage !== undefined) this.targetLeverage = options.crossLeverage;
   }
 
   // Signing state.
   agentAccount: PrivateKeyAccount | null = null;
-  mainAddress: `0x${string}` | null = null;
+  /** Account every query targets: the master account, or the sub-account when trading one. */
+  accountAddress: `0x${string}` | null = null;
   userId: string | null = null;
   /** Where the credentials came from (set by subclasses that resolve them). */
   credentialSource: string | null = null;
@@ -314,7 +88,7 @@ export class HyperliquidExecutor implements ExchangeClient {
   private fillsSubscription: hl.ISubscription | null = null;
 
   // Cache of raw fills keyed by oid, populated by the WS userFills handler.
-  // Maps oid → array of partial fills so aggregateOrderFills() can sum them
+  // Maps oid → array of partial fills so aggregateFills() can sum them
   // exactly as the poll path does. FIFO eviction at fillCacheMaxSize keeps
   // memory bounded; no TTL because oids never repeat (a stale entry can
   // only matter if looked up, and lookups are by-oid). At HL's observed
@@ -342,31 +116,14 @@ export class HyperliquidExecutor implements ExchangeClient {
   // strategy's free collateral. Clamped to the coin's maxLeverage.
   targetLeverage: number = 5;
 
-  // Patient maker fields — step-aggressive repricing inside the wait
-  // window. The bot posts 3 LIMIT `Alo` (post-only) orders in sequence:
-  //
-  //   step 1 (0–t1):  price = oracle (joins queue at touch)
-  //   step 2 (t1–t2): cancel + repost at oracle ± 1 tick (more aggressive)
-  //   step 3 (t2–t3): cancel + repost at oracle ± 2 ticks
-  //   t3+:            cancel + MARKET IOC fallback (caller-side)
-  //
-  // Each step waits `MaxWaitMs / 3` (default ~80s) before reprice. If
-  // postOnly rejects at step 2/3 because the new price would cross
-  // (rare — spread tightened during the wait), we jump ahead to the
-  // next step rather than going straight to taker. Final cancel still
-  // happens before fallback so the resting limit isn't double-filled.
-  //
-  // Defaults tuned for HL BNB observed flow (median trade ~$500, ~3
-  // trades/min): 240s × 3-step repricing → estimated ~98% maker fill
-  // rate for sub-$5k orders. Override with `makerWaitMs`.
-  makerCloseMaxWaitMs: number = 240_000;
-  makerCloseFillCheckIntervalMs: number = 3_000;
-  makerCloseStepCount: number = 3;
-  // GoodTilSec is the on-chain TTL (HL auto-cancels resting orders
-  // older than this even if we don't). Set above MaxWaitMs so our
-  // explicit cancel always fires first under normal conditions; HL's
-  // TTL only kicks in on bot crash / restart mid-attempt.
-  makerCloseGoodTilSec: number = 5 * 60;
+  // Maker ladder: `makerSteps` post-only orders, each resting
+  // `makerWaitMs / makerSteps` (80 s by default) and one tick more
+  // aggressive than the last; then a taker IOC for whatever is unfilled.
+  // A post-only rejection (the spread moved) skips to the next step.
+  // Tuned on HL's BNB flow: ~98% maker fills for sub-$5k orders.
+  makerWaitMs: number = 240_000;
+  makerPollMs: number = 3_000;
+  makerSteps: number = 3;
 
   /**
    * Connect with the credentials passed to the constructor. Subclasses
@@ -394,7 +151,7 @@ export class HyperliquidExecutor implements ExchangeClient {
     this.agentAccount = privateKeyToAccount(agentPrivateKey as `0x${string}`);
     // Queries target the sub-account when trading one; orders are signed by
     // the agent on its behalf via `defaultVaultAddress`.
-    this.mainAddress = (vaultAddress ?? accountAddress) as `0x${string}`;
+    this.accountAddress = (vaultAddress ?? accountAddress) as `0x${string}`;
     this.credentialSource = source;
 
     const transport = new hl.HttpTransport({ isTestnet: this.testnet });
@@ -419,7 +176,7 @@ export class HyperliquidExecutor implements ExchangeClient {
       this.wsTransport = new hl.WebSocketTransport({ isTestnet: this.testnet });
       this.subClient = new hl.SubscriptionClient({ transport: this.wsTransport });
       this.fillsSubscription = await this.subClient.userFills(
-        { user: this.mainAddress },
+        { user: this.accountAddress },
         (data) => this._onUserFillsEvent(data),
       );
     } catch (err: unknown) {
@@ -435,7 +192,7 @@ export class HyperliquidExecutor implements ExchangeClient {
 
     this.logger.log(
       'info',
-      `HlClient connected: account=${this.mainAddress} agent=${this.agentAccount.address} testnet=${this.testnet} source=${source}`,
+      `HlClient connected: account=${this.accountAddress} agent=${this.agentAccount.address} testnet=${this.testnet} source=${source}`,
     );
     return this;
   }
@@ -446,14 +203,14 @@ export class HyperliquidExecutor implements ExchangeClient {
     agent: PrivateKeyAccount;
     main: `0x${string}`;
   } {
-    if (!this.exchange || !this.info || !this.agentAccount || !this.mainAddress) {
+    if (!this.exchange || !this.info || !this.agentAccount || !this.accountAddress) {
       throw new Error('HlClient not connected; call connect() first');
     }
     return {
       exchange: this.exchange,
       info: this.info,
       agent: this.agentAccount,
-      main: this.mainAddress,
+      main: this.accountAddress,
     };
   }
 
@@ -497,7 +254,7 @@ export class HyperliquidExecutor implements ExchangeClient {
    */
   async getOpenOrders(market: string): Promise<OpenOrderInfo[]> {
     const { info, main } = this._requireConnected();
-    const coin = stripUsdSuffix(this.toMarketKey(market));
+    const coin = coinOf(this.toMarketKey(market));
     const orders = await info.frontendOpenOrders({ user: main });
     return orders
       .filter((o) => o.coin === coin)
@@ -540,7 +297,7 @@ export class HyperliquidExecutor implements ExchangeClient {
    */
   async getFundingRates(market: string, startMs: number, endMs: number): Promise<Array<{ time: number; rate: number }>> {
     const { info } = this._requireConnected();
-    const coin = stripUsdSuffix(this.toMarketKey(market));
+    const coin = coinOf(this.toMarketKey(market));
     const out: Array<{ time: number; rate: number }> = [];
     let from = startMs;
     for (let page = 0; page < 50; page++) {
@@ -559,7 +316,7 @@ export class HyperliquidExecutor implements ExchangeClient {
    */
   async getFundingSince(market: string, startMs: number, endMs?: number): Promise<number> {
     const { info, main } = this._requireConnected();
-    const coin = stripUsdSuffix(this.toMarketKey(market));
+    const coin = coinOf(this.toMarketKey(market));
     const rows = await info.userFunding({
       user: main,
       startTime: startMs,
@@ -580,11 +337,7 @@ export class HyperliquidExecutor implements ExchangeClient {
   }
 
   toMarketKey(spotSymbol: string): string {
-    if (SYMBOL_TO_MARKET[spotSymbol]) return SYMBOL_TO_MARKET[spotSymbol];
-    if (spotSymbol.includes('-')) return spotSymbol;
-    // Best-effort fallback for unknown symbols matching `<BASE>USD[CT]?`.
-    const m = spotSymbol.match(/^([A-Z0-9]+?)USD[CT]?$/);
-    return m && m[1] ? `${m[1]}-USD` : spotSymbol;
+    return toMarket(spotSymbol);
   }
 
   async getBalance(): Promise<ExchangeBalance> {
@@ -679,7 +432,7 @@ export class HyperliquidExecutor implements ExchangeClient {
    * HL's order endpoint returns `oid` synchronously, but the `userFills`
    * propagation lags by a few hundred ms on average — so we poll. The
    * caller passes the oid harvested from `order()` or
-   * `_openMakerAttempt`/`_closeMakerAttempt` return values.
+   * `_makerLadder` return values.
    */
   async getFillsForOrder(
     oid: number,
@@ -702,7 +455,7 @@ export class HyperliquidExecutor implements ExchangeClient {
         });
         const matched = fills.filter((f) => f.oid === oid);
         if (matched.length > 0) {
-          return aggregateOrderFills(oid, matched);
+          return aggregateFills(oid, matched);
         }
       } catch (err) {
         lastErr = err;
@@ -736,12 +489,12 @@ export class HyperliquidExecutor implements ExchangeClient {
       ...(endMs !== undefined ? { endTime: endMs } : {}),
       aggregateByTime: false,
     });
-    return raw.map(normalizeHlFill);
+    return raw.map(normalizeFill);
   }
 
   async getOraclePrice(market: string): Promise<number> {
     const { info } = this._requireConnected();
-    const coin = stripUsdSuffix(market);
+    const coin = coinOf(market);
     const [, assetCtxs] = await info.metaAndAssetCtxs();
     const idx = await this._assetIdxFor(coin);
     const ctx = assetCtxs[idx];
@@ -749,67 +502,13 @@ export class HyperliquidExecutor implements ExchangeClient {
     return Number(ctx.markPx);
   }
 
-  /**
-   * Format a price string that HL accepts. The rules (from the HL API
-   * docs + observed rejections during the 2026-05-20 smoke test):
-   *   1. Integer prices are always OK regardless of precision.
-   *   2. Non-integer prices must have at most **5 significant figures**.
-   *   3. AND at most `MAX_DECIMALS - szDecimals` decimal places, where
-   *      `MAX_DECIMALS = 6` for perps. So a coin with szDecimals=2
-   *      (SOL) gets 4 max decimals on its price; ETH (szDecimals=4)
-   *      gets 2; BNB (szDecimals=3) gets 3.
-   * Both constraints must hold simultaneously — we pick the more
-   * restrictive of the two.
-   */
-  private _formatPrice(coin: string, px: number): string {
-    if (!Number.isFinite(px) || px <= 0) throw new Error(`HlClient: invalid price ${px} for ${coin}`);
-    if (Number.isInteger(px)) return String(px);
-    const szDecimals = this.szDecimalsByCoin.get(coin);
-    const maxDecimalsByPrecision = szDecimals !== undefined ? Math.max(0, 6 - szDecimals) : 8;
-    // 5 significant figures via toPrecision(5), then re-round to the
-    // max decimals derived from szDecimals to satisfy rule 3 as well.
-    const sigFigs = Number(px.toPrecision(5));
-    return Number(sigFigs.toFixed(maxDecimalsByPrecision)).toString();
-  }
-
-  /**
-   * Format a size string that HL accepts. HL rejects sizes with more
-   * decimal places than the coin's `szDecimals` (e.g. SOL=2, ETH=4).
-   *
-   * Throws on cache miss instead of guessing a 4-decimal default —
-   * a wrong precision is silently rejected by HL as "Order has
-   * invalid size" and would loop the strategy on that coin until the
-   * next discovery refresh. Every call site already awaits
-   * `_assetIdxFor(coin)` immediately before, which guarantees the
-   * cache is populated; if it isn't, that's a real invariant
-   * violation we want surfaced in Sentry rather than masked.
-   */
-  private _formatSize(coin: string, sz: number): string {
-    if (!Number.isFinite(sz) || sz <= 0) throw new Error(`HlClient: invalid size ${sz} for ${coin}`);
-    const szDecimals = this.szDecimalsByCoin.get(coin);
-    if (szDecimals === undefined) {
-      throw new Error(
-        `HlClient: szDecimals cache miss for ${coin} — call _assetIdxFor(${coin}) before _formatSize`,
-      );
+  /** Size string with the coin's decimals; a cache miss is an invariant violation, so it throws. */
+  private _size(coin: string, sz: number): string {
+    const decimals = this.szDecimalsByCoin.get(coin);
+    if (decimals === undefined) {
+      throw new Error(`HlClient: szDecimals cache miss for ${coin} (call _assetIdxFor first)`);
     }
-    return sz.toFixed(szDecimals);
-  }
-
-  /**
-   * HL price tick derived from the 5-significant-figures rule applied
-   * to non-integer perp prices. For BNB at ~$640 the tick is $0.01;
-   * SOL at ~$200 also $0.01; ETH at ~$4,000 is $0.1; BTC at ~$100k is
-   * $10. Used by step-aggressive maker repricing to nudge an order one
-   * tick closer to crossing the spread each step.
-   *
-   * Falls back to $0.01 for tiny prices to avoid sub-cent ticks that
-   * HL rejects.
-   */
-  private _priceTick(price: number): number {
-    if (!Number.isFinite(price) || price <= 0) return 0.01;
-    const magnitude = Math.floor(Math.log10(price));
-    const tick = Math.pow(10, magnitude - 4);
-    return Math.max(tick, 0.000001);
+    return formatSize(sz, decimals);
   }
 
   /**
@@ -864,7 +563,7 @@ export class HyperliquidExecutor implements ExchangeClient {
       while (true) {
         const cached = this.fillCacheByOid.get(oid);
         if (cached && cached.length > 0) {
-          const agg = aggregateOrderFills(oid, cached);
+          const agg = aggregateFills(oid, cached);
           if (agg && agg.totalFee > 0) return agg.totalFee;
         }
         if (Date.now() >= cacheDeadline) break;
@@ -915,7 +614,7 @@ export class HyperliquidExecutor implements ExchangeClient {
    * Returns `null` on any failure / empty book / crossed book; callers
    * fall back to the legacy oracle-based step formula in that case.
    */
-  private async _getBbo(coin: string): Promise<{ bestBid: number; bestAsk: number } | null> {
+  private async _getBbo(coin: string): Promise<BestBidOffer | null> {
     const { info } = this._requireConnected();
     try {
       const book = await info.l2Book({ coin });
@@ -937,42 +636,6 @@ export class HyperliquidExecutor implements ExchangeClient {
     }
   }
 
-  /**
-   * Compute the maker limit price for a given step (1..N).
-   *
-   * When BBO is available (the normal case):
-   *   - Step 1 (most patient): BUY @ bestBid, SELL @ bestAsk — strictly
-   *     on our side of the book, guaranteed not to cross.
-   *   - Step N (more aggressive): BUY @ bestBid + (N-1)·tick, capped at
-   *     bestAsk - 1·tick so we never cross. SELL is the mirror.
-   *   - On a 1-tick spread all steps collapse to step 1 (correct: any
-   *     more aggressive price would cross).
-   *
-   * When BBO is `null` (l2Book failed): fall back to the legacy
-   * oracle-based formula. Same monotonic step direction as before so
-   * callers see no behaviour drift on the fallback path.
-   */
-  private _stepPrice(
-    bbo: { bestBid: number; bestAsk: number } | null,
-    oraclePrice: number,
-    side: 'BUY' | 'SELL',
-    step: number,
-  ): number {
-    const tick = this._priceTick(oraclePrice);
-    const delta = Math.max(0, step - 1) * tick;
-    if (bbo) {
-      if (side === 'BUY') {
-        const cap = bbo.bestAsk - tick;
-        return Math.min(bbo.bestBid + delta, cap);
-      }
-      const floor = bbo.bestBid + tick;
-      return Math.max(bbo.bestAsk - delta, floor);
-    }
-    return side === 'BUY'
-      ? oraclePrice + delta
-      : oraclePrice - delta;
-  }
-
   private async _placeMarketIoc(
     spotSymbol: string,
     side: 'BUY' | 'SELL',
@@ -982,7 +645,7 @@ export class HyperliquidExecutor implements ExchangeClient {
   ): Promise<ExchangeTradeResult | null> {
     const { exchange } = this._requireConnected();
     const market = this.toMarketKey(spotSymbol);
-    const coin = stripUsdSuffix(market);
+    const coin = coinOf(market);
     const idx = await this._assetIdxFor(coin);
     const mark = await this.getOraclePrice(market);
     // Compute an aggressive limit price that's guaranteed to cross the
@@ -996,22 +659,17 @@ export class HyperliquidExecutor implements ExchangeClient {
     //      L2 book is empty / crossed / unreachable. Same behaviour as
     //      before so we don't regress on the happy path.
     const bbo = await this._getBbo(coin);
-    const buffer = 0.0025;
-    let px: number;
-    if (bbo) {
-      px = side === 'BUY' ? bbo.bestAsk * (1 + buffer) : bbo.bestBid * (1 - buffer);
-    } else {
-      const slippage = 0.005;
-      px = side === 'BUY' ? mark * (1 + slippage) : mark * (1 - slippage);
-    }
+    const px = bbo
+      ? (side === 'BUY' ? bbo.bestAsk * (1 + TAKER_CROSS_BUFFER) : bbo.bestBid * (1 - TAKER_CROSS_BUFFER))
+      : (side === 'BUY' ? mark * (1 + NO_BOOK_SLIPPAGE) : mark * (1 - NO_BOOK_SLIPPAGE));
 
     const res = await exchange.order({
       orders: [
         {
           a: idx,
           b: side === 'BUY',
-          p: this._formatPrice(coin, px),
-          s: this._formatSize(coin, sizeBase),
+          p: formatPrice(px, this.szDecimalsByCoin.get(coin)),
+          s: this._size(coin, sizeBase),
           r: reduceOnly,
           t: { limit: { tif: 'Ioc' } },
         },
@@ -1042,14 +700,13 @@ export class HyperliquidExecutor implements ExchangeClient {
     } else if ('resting' in status) {
       oid = status.resting.oid;
     }
-    const feeRate = HL_TAKER_FEE_RATE; // HL Tier 0 taker (0.045%); IOC = taker.
     return {
       orderId: oid,
       market,
       side,
       size: fillSize,
       price: fillPx,
-      fee: fillSize * fillPx * feeRate,
+      fee: fillSize * fillPx * HL_TAKER_FEE_RATE,
       reason,
       timestamp: new Date().toISOString(),
     };
@@ -1067,7 +724,7 @@ export class HyperliquidExecutor implements ExchangeClient {
   ): Promise<void> {
     const ns = ctx?.namespace;
     if (!ns || !this.orderStateSink) return;
-    const ttl = Math.ceil(this.makerCloseMaxWaitMs / 1000) + 30;
+    const ttl = Math.ceil(this.makerWaitMs / 1000) + 30;
     try {
       await this.orderStateSink.publish(ns, market, value, ttl);
     } catch (err: unknown) {
@@ -1091,348 +748,133 @@ export class HyperliquidExecutor implements ExchangeClient {
   }
 
   /**
-   * Patient maker close with step-aggressive repricing. Posts LIMIT
-   * `Alo` (post-only) reduce-only at `_stepPrice(oracle, side, step)`,
-   * polls positions every `FillCheckIntervalMs` until either the
-   * position shrinks below 10% of `initialSize` (filled) or the
-   * step's slice of `MaxWaitMs` elapses. On step timeout, cancels and
-   * reposts one tick more aggressive (closer to crossing). After all
-   * `StepCount` steps elapse → final cancel, return null so caller
-   * falls back to MARKET IOC.
+   * The maker ladder, shared by entries and exits. Posts a post-only
+   * limit at `stepPrice(...)` for the size still unfilled, polls the
+   * position every `makerPollMs`, and on each step timeout cancels and
+   * reposts one tick more aggressive. Progress is read from the on-chain
+   * position (entries grow it, reduce-only exits shrink it), so fills on
+   * earlier steps are never re-sent.
    *
-   * postOnly rejection at step N skips ahead to step N+1 rather than
-   * abandoning to taker — keeps the maker chance alive when the spread
-   * tightens mid-attempt.
-   *
-   * Returns null on any unrecoverable failure — never throws so the
-   * caller can always rely on the taker fallback.
+   * Returns the filled result once `MAKER_FILLED_SHARE` of the size has
+   * moved (the caller sweeps the rest with an IOC), or `null` when the
+   * ladder ran out of time or could not rest an order. Never throws, so
+   * the caller can always fall back to the taker path. Every order it
+   * placed is cancelled on the way out.
    */
-  private async _closeMakerAttempt(
-    spotSymbol: string,
-    closeSide: 'BUY' | 'SELL',
-    initialSize: number,
-    positionSide: 'LONG' | 'SHORT',
-    reason: string,
-    ctx?: OrderCallContext,
-  ): Promise<ExchangeTradeResult | null> {
+  private async _makerLadder(args: {
+    spotSymbol: string;
+    side: 'BUY' | 'SELL';
+    size: number;
+    reduceOnly: boolean;
+    reason: string;
+    /** `reason` recorded on the result (closes prefix the position side). */
+    resultReason: string;
+    ctx?: OrderCallContext;
+  }): Promise<ExchangeTradeResult | null> {
+    const { spotSymbol, side, size, reduceOnly, reason, resultReason, ctx } = args;
     const { exchange } = this._requireConnected();
+    const label = reduceOnly ? 'close' : 'open';
     const market = this.toMarketKey(spotSymbol);
-    const coin = stripUsdSuffix(market);
+    const coin = coinOf(market);
     const idx = await this._assetIdxFor(coin);
     const oraclePrice = await this.getOraclePrice(market);
     const bbo = await this._getBbo(coin);
-    // Measure fills against the on-chain size before we start, so the
-    // filled amount is ours even if the aggregate is larger.
-    const preSize = Math.abs(
-      Number((await this.getPositions())[market]?.size ?? initialSize),
-    );
+    const position = async () => {
+      const cur = (await this.getPositions())[market];
+      return { size: cur ? Math.abs(Number(cur.size)) : 0, entryPrice: cur ? Number(cur.entryPrice) : NaN };
+    };
+    // Progress is measured against the size before we start, so the moved
+    // amount is ours even when the on-chain aggregate is larger.
+    const baseSize = (await position()).size;
+    const moved = (current: number) => Math.max(0, reduceOnly ? baseSize - current : current - baseSize);
+    // Entries report the venue's average entry; exits the current mark.
+    const fillPrice = async (entryPrice: number, fallback: number) =>
+      reduceOnly
+        ? this.getOraclePrice(market).catch(() => fallback)
+        : Number.isFinite(entryPrice) && entryPrice > 0 ? entryPrice : fallback;
 
     const startedAt = Date.now();
-    const totalWait = this.makerCloseMaxWaitMs;
-    const overallDeadline = startedAt + totalWait;
-    const stepCount = Math.max(1, this.makerCloseStepCount);
-    const stepWindowMs = Math.floor(totalWait / stepCount);
+    const deadline = startedAt + this.makerWaitMs;
+    const steps = Math.max(1, this.makerSteps);
+    const stepMs = Math.floor(this.makerWaitMs / steps);
+    const anchor = bbo ? `bid=$${bbo.bestBid} ask=$${bbo.bestAsk}` : `oracle=$${oraclePrice} (no BBO)`;
+    this.logger.log('info', `HlClient MAKER ${side} ${market}: size=${size} ${anchor} ${label}: ${reason} (${steps}-step x ${stepMs}ms)`);
 
-    const anchor = bbo
-      ? `bid=$${bbo.bestBid} ask=$${bbo.bestAsk}`
-      : `oracle=$${oraclePrice} (no BBO)`;
-    this.logger.log(
-      'info',
-      `HlClient MAKER ${closeSide} ${market}: size=${initialSize} ${anchor} close ${positionSide}: ${reason} (${stepCount}-step × ${stepWindowMs}ms, wait=${totalWait}ms)`,
-    );
+    const filledResult = async (oid: number, filled: number, px: number): Promise<ExchangeTradeResult> => {
+      const fee = await this._resolveFillFee(oid, filled, px, HL_MAKER_FEE_RATE);
+      this.logger.log('info', `HlClient MAKER ${label} filled: ${side} ${market} ${filled} @ ~$${px} (fee $${fee.toFixed(4)})`);
+      return { orderId: oid, market, side, size: filled, price: px, fee, reason: resultReason, timestamp: new Date().toISOString() };
+    };
 
-    const placedOids: number[] = [];
+    const placed: number[] = [];
     try {
-      for (let step = 1; step <= stepCount; step++) {
-        const stepDeadline = Math.min(
-          startedAt + step * stepWindowMs,
-          overallDeadline,
-        );
-        const stepPrice = this._stepPrice(bbo, oraclePrice, closeSide, step);
+      for (let step = 1; step <= steps; step++) {
+        const stepDeadline = Math.min(startedAt + step * stepMs, deadline);
+        const price = stepPrice(bbo, oraclePrice, side, step);
 
-        let res: Awaited<ReturnType<typeof exchange.order>>;
-        try {
-          res = await exchange.order({
-            orders: [
-              {
-                a: idx,
-                b: closeSide === 'BUY',
-                p: this._formatPrice(coin, stepPrice),
-                s: this._formatSize(coin, initialSize),
-                r: true,
-                t: { limit: { tif: 'Alo' } },
-              },
-            ],
-            grouping: 'na',
-          });
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.logger.log(
-            'warning',
-            `HlClient MAKER close step${step} placeOrder threw: ${msg} — advancing to next step`,
-          );
-          continue;
-        }
-
-        const status = res.response?.data?.statuses?.[0];
-        if (!status || typeof status === 'string' || 'error' in status) {
-          const detail = typeof status === 'string'
-            ? status
-            : status && 'error' in status ? status.error : 'empty';
-          // postOnly reject (crossed spread) or other rejection: skip
-          // ahead to next step. On the LAST step a reject means we
-          // can't get maker at all → fall back to taker.
-          if (step < stepCount) {
-            this.logger.log(
-              'info',
-              `HlClient MAKER close step${step} not accepted: ${detail} — advancing to step${step + 1}`,
-            );
-            continue;
-          }
-          this.logger.log(
-            'warning',
-            `HlClient MAKER close step${step} not accepted: ${detail} — falling back to taker`,
-          );
-          return null;
-        }
-
-        let oid = 0;
-        if ('filled' in status) {
-          oid = status.filled.oid;
-          const fillPx = Number(status.filled.avgPx);
-          const fillSize = Number(status.filled.totalSz);
-          const fee = await this._resolveFillFee(oid, fillSize, fillPx, HL_MAKER_FEE_RATE);
-          this.logger.log(
-            'info',
-            `HlClient MAKER close filled instantly step${step}: ${closeSide} ${market} @ $${fillPx} (fee $${fee.toFixed(4)})`,
-          );
-          return {
-            orderId: oid, market, side: closeSide, size: fillSize,
-            price: fillPx, fee, reason: `close ${positionSide}: ${reason}`,
-            timestamp: new Date().toISOString(),
-          };
-        }
-        if ('resting' in status) { oid = status.resting.oid; placedOids.push(oid); }
-
-        await this._publishOrderState(ctx, market, {
-          state: step === 1 ? 'maker-waiting' : step === 2 ? 'maker-step2' : 'maker-step3',
-          startedAt,
-          deadlineAt: overallDeadline,
-          reason,
-          currentStep: Math.min(step, 3) as 1 | 2 | 3,
-          oid,
-        });
-
-        // Poll until step deadline or fill.
-        while (Date.now() < stepDeadline) {
-          await new Promise((r) => setTimeout(r, this.makerCloseFillCheckIntervalMs));
-          const positions = await this.getPositions();
-          const cur = positions[market];
-          const curSize = cur ? Math.abs(Number(cur.size)) : 0;
-          // ≥90% of our share gone counts as filled; closePosition sweeps
-          // the leftover with a reduce-only IOC so no dust stays open.
-          if (curSize <= preSize - initialSize * 0.9) {
-            const fillPx = await this.getOraclePrice(market).catch(() => stepPrice);
-            const filledSize = Math.min(initialSize, preSize - curSize);
-            const fee = await this._resolveFillFee(oid, filledSize, fillPx, HL_MAKER_FEE_RATE);
-            this.logger.log(
-              'info',
-              `HlClient MAKER close filled step${step}: ${closeSide} ${market} @ ~$${fillPx.toFixed(2)} (fee $${fee.toFixed(4)})`,
-            );
-            return {
-              orderId: oid, market, side: closeSide, size: filledSize,
-              price: fillPx, fee, reason: `close ${positionSide}: ${reason}`,
-              timestamp: new Date().toISOString(),
-            };
-          }
-        }
-
-        // Step timeout — cancel before reprice (or final fallback).
-        if (oid) {
-          try {
-            await exchange.cancel({ cancels: [{ a: idx, o: oid }] });
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.logger.log('warning', `HlClient MAKER step${step} cancel oid=${oid} failed: ${msg}`);
-          }
-        }
-
-        if (step < stepCount) {
-          this.logger.log(
-            'info',
-            `HlClient MAKER close step${step} timeout — repricing one tick more aggressive (step${step + 1})`,
-          );
-        }
-      }
-    } finally {
-      await this._cancelIfResting(idx, coin, placedOids);
-      await this._clearOrderState(ctx, market);
-    }
-
-    this.logger.log(
-      'info',
-      `HlClient MAKER close all ${stepCount} steps timeout (${totalWait}ms) — falling back to taker`,
-    );
-    // Final settle window so any race-fill from the last cancel is
-    // observed by the "position-still-open" recheck below.
-    await new Promise((r) => setTimeout(r, 1500));
-    return null;
-  }
-
-  /**
-   * Patient maker entry with step-aggressive repricing. Mirrors
-   * `_closeMakerAttempt` but detects fill via position GROWTH instead
-   * of shrinkage. On step timeout: cancel + repost one tick more
-   * aggressive (closer to crossing). On postOnly rejection at non-final
-   * step: skip ahead. On final timeout: cancel + return null so caller
-   * falls back to MARKET IOC.
-   */
-  private async _openMakerAttempt(
-    spotSymbol: string,
-    side: 'BUY' | 'SELL',
-    sizeBase: number,
-    reason: string,
-    ctx?: OrderCallContext,
-  ): Promise<ExchangeTradeResult | null> {
-    const { exchange } = this._requireConnected();
-    const market = this.toMarketKey(spotSymbol);
-    const coin = stripUsdSuffix(market);
-    const idx = await this._assetIdxFor(coin);
-    const oraclePrice = await this.getOraclePrice(market);
-    const bbo = await this._getBbo(coin);
-    const beforeSize = Math.abs(
-      Number((await this.getPositions())[market]?.size ?? 0),
-    );
-    const placedOids: number[] = [];
-
-    const startedAt = Date.now();
-    const totalWait = this.makerCloseMaxWaitMs;
-    const overallDeadline = startedAt + totalWait;
-    const stepCount = Math.max(1, this.makerCloseStepCount);
-    const stepWindowMs = Math.floor(totalWait / stepCount);
-
-    const anchor = bbo
-      ? `bid=$${bbo.bestBid} ask=$${bbo.bestAsk}`
-      : `oracle=$${oraclePrice} (no BBO)`;
-    this.logger.log(
-      'info',
-      `HlClient MAKER ${side} ${market}: size=${sizeBase} ${anchor} open: ${reason} (${stepCount}-step × ${stepWindowMs}ms, wait=${totalWait}ms)`,
-    );
-
-    try {
-      for (let step = 1; step <= stepCount; step++) {
-        const stepDeadline = Math.min(
-          startedAt + step * stepWindowMs,
-          overallDeadline,
-        );
-        const stepPrice = this._stepPrice(bbo, oraclePrice, side, step);
-
-        // Re-post only what is still unfilled: a partial fill on an
-        // earlier step followed by a full-size repost used to stack up
-        // to ~2x the intended position.
-        let stepSize = sizeBase;
+        // Re-post only what is still unfilled (re-sending the full size
+        // after a partial fill once stacked positions up to ~2x).
+        let remaining = size;
         if (step > 1) {
-          const nowSize = Math.abs(Number((await this.getPositions())[market]?.size ?? 0));
-          const filledSoFar = Math.max(0, nowSize - beforeSize);
-          stepSize = sizeBase - filledSoFar;
-          if (stepSize * oraclePrice < DUST_NOTIONAL_USD || stepSize < sizeBase * 0.1) {
-            const fillPx = Number((await this.getPositions())[market]?.entryPrice ?? stepPrice) || stepPrice;
-            return {
-              orderId: 0, market, side, size: filledSoFar,
-              price: fillPx, fee: filledSoFar * fillPx * HL_MAKER_FEE_RATE,
-              reason, timestamp: new Date().toISOString(),
-            };
+          const now = await position();
+          const done = moved(now.size);
+          remaining = size - done;
+          if (remaining < size * (1 - MAKER_FILLED_SHARE) || remaining * oraclePrice < DUST_NOTIONAL_USD) {
+            return await filledResult(0, done, await fillPrice(now.entryPrice, price));
           }
         }
 
         let res: Awaited<ReturnType<typeof exchange.order>>;
         try {
           res = await exchange.order({
-            orders: [
-              {
-                a: idx,
-                b: side === 'BUY',
-                p: this._formatPrice(coin, stepPrice),
-                s: this._formatSize(coin, stepSize),
-                r: false,
-                t: { limit: { tif: 'Alo' } },
-              },
-            ],
+            orders: [{
+              a: idx,
+              b: side === 'BUY',
+              p: formatPrice(price, this.szDecimalsByCoin.get(coin)),
+              s: this._size(coin, remaining),
+              r: reduceOnly,
+              t: { limit: { tif: 'Alo' } },
+            }],
             grouping: 'na',
           });
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          this.logger.log(
-            'warning',
-            `HlClient MAKER open step${step} placeOrder threw: ${msg} — advancing to next step`,
-          );
+          this.logger.log('warning', `HlClient MAKER ${label} step${step} placeOrder threw: ${msg}; next step`);
           continue;
         }
 
         const status = res.response?.data?.statuses?.[0];
         if (!status || typeof status === 'string' || 'error' in status) {
-          const detail = typeof status === 'string'
-            ? status
-            : status && 'error' in status ? status.error : 'empty';
-          if (step < stepCount) {
-            this.logger.log(
-              'info',
-              `HlClient MAKER open step${step} not accepted: ${detail} — advancing to step${step + 1}`,
-            );
+          const detail = typeof status === 'string' ? status : status && 'error' in status ? status.error : 'empty';
+          if (step < steps) {
+            this.logger.log('info', `HlClient MAKER ${label} step${step} not accepted: ${detail}; next step`);
             continue;
           }
-          this.logger.log(
-            'warning',
-            `HlClient MAKER open step${step} not accepted: ${detail} — falling back to taker`,
-          );
+          this.logger.log('warning', `HlClient MAKER ${label} step${step} not accepted: ${detail}; taker fallback`);
           return null;
         }
 
-        let oid = 0;
         if ('filled' in status) {
-          oid = status.filled.oid;
-          const fillPx = Number(status.filled.avgPx);
-          const fillSize = Number(status.filled.totalSz);
-          const fee = await this._resolveFillFee(oid, fillSize, fillPx, HL_MAKER_FEE_RATE);
-          this.logger.log(
-            'info',
-            `HlClient MAKER open filled instantly step${step}: ${side} ${market} @ $${fillPx} (fee $${fee.toFixed(4)})`,
-          );
-          return {
-            orderId: oid, market, side, size: fillSize,
-            price: fillPx, fee, reason, timestamp: new Date().toISOString(),
-          };
+          return await filledResult(status.filled.oid, Number(status.filled.totalSz), Number(status.filled.avgPx));
         }
-        if ('resting' in status) { oid = status.resting.oid; placedOids.push(oid); }
+        const oid = 'resting' in status ? status.resting.oid : 0;
+        if (oid) placed.push(oid);
 
         await this._publishOrderState(ctx, market, {
           state: step === 1 ? 'maker-waiting' : step === 2 ? 'maker-step2' : 'maker-step3',
           startedAt,
-          deadlineAt: overallDeadline,
-          reason: reason || 'entry',
+          deadlineAt: deadline,
+          reason: reason || (reduceOnly ? 'exit' : 'entry'),
           currentStep: Math.min(step, 3) as 1 | 2 | 3,
           oid,
         });
 
         while (Date.now() < stepDeadline) {
-          await new Promise((r) => setTimeout(r, this.makerCloseFillCheckIntervalMs));
-          const positions = await this.getPositions();
-          const cur = positions[market];
-          const curSize = cur ? Math.abs(Number(cur.size)) : 0;
-          if (curSize >= beforeSize + sizeBase * 0.9) {
-            const fillPx = cur && cur.entryPrice
-              ? Number(cur.entryPrice) || stepPrice
-              : stepPrice;
-            const filledSize = Math.max(curSize - beforeSize, sizeBase);
-            const fee = await this._resolveFillFee(oid, filledSize, fillPx, HL_MAKER_FEE_RATE);
-            this.logger.log(
-              'info',
-              `HlClient MAKER open filled step${step}: ${side} ${market} @ ~$${fillPx.toFixed(2)} (fee $${fee.toFixed(4)})`,
-            );
-            return {
-              orderId: oid, market, side, size: filledSize,
-              price: fillPx, fee, reason, timestamp: new Date().toISOString(),
-            };
+          await new Promise((r) => setTimeout(r, this.makerPollMs));
+          const now = await position();
+          const done = moved(now.size);
+          if (done >= size * MAKER_FILLED_SHARE) {
+            return await filledResult(oid, Math.min(done, size), await fillPrice(now.entryPrice, price));
           }
         }
 
@@ -1444,23 +886,14 @@ export class HyperliquidExecutor implements ExchangeClient {
             this.logger.log('warning', `HlClient MAKER step${step} cancel oid=${oid} failed: ${msg}`);
           }
         }
-
-        if (step < stepCount) {
-          this.logger.log(
-            'info',
-            `HlClient MAKER open step${step} timeout — repricing one tick more aggressive (step${step + 1})`,
-          );
-        }
       }
     } finally {
-      await this._cancelIfResting(idx, coin, placedOids);
+      await this._cancelIfResting(idx, coin, placed);
       await this._clearOrderState(ctx, market);
     }
 
-    this.logger.log(
-      'info',
-      `HlClient MAKER open all ${stepCount} steps timeout (${totalWait}ms) — falling back to taker`,
-    );
+    this.logger.log('info', `HlClient MAKER ${label} ladder timed out after ${this.makerWaitMs}ms; taker fallback`);
+    // Settle window, so a fill racing the last cancel is visible to the caller.
     await new Promise((r) => setTimeout(r, 1500));
     return null;
   }
@@ -1484,7 +917,7 @@ export class HyperliquidExecutor implements ExchangeClient {
   }
 
   /**
-   * Maker-first entry (postOnly ladder for makerCloseMaxWaitMs), then a
+   * Maker-first entry (post-only ladder for `makerWaitMs`), then a
    * taker IOC for whatever the ladder left unfilled. Sizing the IOC to
    * the remainder, not the full order, keeps a partial maker fill from
    * doubling the position.
@@ -1497,11 +930,11 @@ export class HyperliquidExecutor implements ExchangeClient {
     ctx?: OrderCallContext,
   ): Promise<ExchangeTradeResult | null> {
     const market = this.toMarketKey(spotSymbol);
-    await this._ensureLeverage(stripUsdSuffix(market));
+    await this._ensureLeverage(coinOf(market));
     const mark = await this.getOraclePrice(market);
     const size = usdAmount / mark;
     const beforeSize = Math.abs(Number((await this.getPositions())[market]?.size ?? 0));
-    const makerResult = await this._openMakerAttempt(spotSymbol, side, size, reason, ctx);
+    const makerResult = await this._makerLadder({ spotSymbol, side, size, reduceOnly: false, reason, resultReason: reason, ...(ctx ? { ctx } : {}) });
     if (makerResult) return makerResult;
     const filledByMaker = Math.max(
       0,
@@ -1579,7 +1012,7 @@ export class HyperliquidExecutor implements ExchangeClient {
     // expiry-style exits. CLOSE_OPP is explicitly excluded: it's a
     // signal-driven flip and the follow-on entry fires within milliseconds.
     // Routing CLOSE_OPP through the maker ladder would hold the flipOpening
-    // mutex for up to makerCloseMaxWaitMs (~240s), causing the entry signal
+    // mutex for up to makerWaitMs (~240s), causing the entry signal
     // to be silently dropped. Other reasons — TP/SL/RE/EL/AR/ADMIN/flip —
     // stay taker because they're time-critical (risk reduction).
     const preSize = Number(pos!.size);
@@ -1595,9 +1028,10 @@ export class HyperliquidExecutor implements ExchangeClient {
 
     const results: ExchangeTradeResult[] = [];
     if (reason === 'FLAT' || reason === 'MH') {
-      const makerResult = await this._closeMakerAttempt(
-        spotSymbol, closeSide, size, refSide, reason, ctx,
-      );
+      const makerResult = await this._makerLadder({
+        spotSymbol, side: closeSide, size, reduceOnly: true, reason,
+        resultReason: `close ${refSide}: ${reason}`, ...(ctx ? { ctx } : {}),
+      });
       if (makerResult) {
         results.push(makerResult);
       } else {
@@ -1662,7 +1096,7 @@ export class HyperliquidExecutor implements ExchangeClient {
   ): Promise<TpSlOrders> {
     const { exchange } = this._requireConnected();
     const market = this.toMarketKey(spotSymbol);
-    const coin = stripUsdSuffix(market);
+    const coin = coinOf(market);
     const idx = await this._assetIdxFor(coin);
     // Closing side is opposite of position direction.
     const closeIsBuy = direction === 'SHORT';
@@ -1672,10 +1106,10 @@ export class HyperliquidExecutor implements ExchangeClient {
         {
           a: idx,
           b: closeIsBuy,
-          p: this._formatPrice(coin, tpPrice),
-          s: this._formatSize(coin, size),
+          p: formatPrice(tpPrice, this.szDecimalsByCoin.get(coin)),
+          s: this._size(coin, size),
           r: true,
-          t: { trigger: { isMarket: false, triggerPx: this._formatPrice(coin, tpPrice), tpsl: 'tp' } },
+          t: { trigger: { isMarket: false, triggerPx: formatPrice(tpPrice, this.szDecimalsByCoin.get(coin)), tpsl: 'tp' } },
         },
         {
           a: idx,
@@ -1689,10 +1123,10 @@ export class HyperliquidExecutor implements ExchangeClient {
           // SHORT close (closeIsBuy=true), it's ABOVE. 5% is generous
           // enough to clear any realistic candle gap on ETH/SOL/BNB
           // while still capping catastrophic slippage.
-          p: this._formatPrice(coin, closeIsBuy ? slPrice * 1.05 : slPrice * 0.95),
-          s: this._formatSize(coin, size),
+          p: formatPrice(closeIsBuy ? slPrice * 1.05 : slPrice * 0.95, this.szDecimalsByCoin.get(coin)),
+          s: this._size(coin, size),
           r: true,
-          t: { trigger: { isMarket: true, triggerPx: this._formatPrice(coin, slPrice), tpsl: 'sl' } },
+          t: { trigger: { isMarket: true, triggerPx: formatPrice(slPrice, this.szDecimalsByCoin.get(coin)), tpsl: 'sl' } },
         },
       ],
       grouping: 'positionTpsl',
@@ -1711,8 +1145,8 @@ export class HyperliquidExecutor implements ExchangeClient {
     // no oid, so the oids were never recorded and TP/SL were never
     // cancelled by id. Resolve them from the open-orders book instead.
     if (!orders.tp || !orders.sl) {
-      const tpPx = Number(this._formatPrice(coin, tpPrice));
-      const slPx = Number(this._formatPrice(coin, slPrice));
+      const tpPx = Number(formatPrice(tpPrice, this.szDecimalsByCoin.get(coin)));
+      const slPx = Number(formatPrice(slPrice, this.szDecimalsByCoin.get(coin)));
       for (let attempt = 0; attempt < 4 && (!orders.tp || !orders.sl); attempt++) {
         if (attempt > 0) await new Promise((r) => setTimeout(r, 500));
         try {
@@ -1743,7 +1177,7 @@ export class HyperliquidExecutor implements ExchangeClient {
     if (!clientId) return;
     const { exchange } = this._requireConnected();
     const market = this.toMarketKey(spotSymbol);
-    const coin = stripUsdSuffix(market);
+    const coin = coinOf(market);
     const idx = await this._assetIdxFor(coin);
     try {
       await exchange.cancel({ cancels: [{ a: idx, o: clientId }] });
@@ -1758,24 +1192,25 @@ export class HyperliquidExecutor implements ExchangeClient {
     if (orders?.sl) await this.cancelTPSLOrder(spotSymbol, orders.sl.clientId, 'sl', orders.sl.goodTilSec);
   }
 
-  async getCandles(market: string, resolution = '4HOURS', limit = 600): Promise<unknown[]> {
+  /**
+   * The last `limit` candles of `market`, oldest first. `resolution`
+   * takes `4HOURS`-style names or native HL intervals (`4h`, `1d`, ...).
+   * The newest candle is usually still forming.
+   */
+  async getCandles(market: string, resolution = '4HOURS', limit = 600): Promise<Candle[]> {
     const { info } = this._requireConnected();
-    const coin = stripUsdSuffix(market);
-    const interval = resolutionToInterval(resolution);
+    const interval = toInterval(resolution);
     const endTime = Date.now();
-    const startTime = endTime - intervalToMs(interval) * limit;
-    const candles = await info.candleSnapshot({ coin, interval, startTime, endTime });
-    // Map HL's t,T,o,c,h,l,v,n to `{ startedAt, open, high, low, close, ... }`.
+    const startTime = endTime - intervalMs(interval) * limit;
+    const candles = await info.candleSnapshot({ coin: coinOf(market), interval, startTime, endTime });
     return candles.map((c) => ({
       startedAt: new Date(c.t).toISOString(),
-      open: c.o,
-      high: c.h,
-      low: c.l,
-      close: c.c,
-      baseTokenVolume: c.v,
-      usdVolume: '0',
+      open: Number(c.o),
+      high: Number(c.h),
+      low: Number(c.l),
+      close: Number(c.c),
+      volume: Number(c.v),
       trades: c.n,
-      resolution,
     }));
   }
 }
