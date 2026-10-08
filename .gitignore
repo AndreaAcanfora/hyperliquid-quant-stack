@@ -10,3 +10,7 @@ coverage/
 data/cache/
 *.tsbuildinfo
 .vercel
+
+# Playwright
+test-results/
+playwright-report/
