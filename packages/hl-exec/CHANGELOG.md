@@ -1,5 +1,11 @@
 # @andreaaca/hl-exec
 
+## 0.2.1
+
+### Patch Changes
+
+- [#4](https://github.com/AndreaAcanfora/hyperliquid-quant-stack/pull/4) [`4a6e34e`](https://github.com/AndreaAcanfora/hyperliquid-quant-stack/commit/4a6e34ea911d684b89867668e8bc430f8c686219) Thanks [@AndreaAcanfora](https://github.com/AndreaAcanfora)! - Entries no longer drop a partial maker fill. When the taker IOC for the remainder is rejected (for example during a fast move), it is retried up to 3 times on a fresh book. If it never fills, `openLong`/`openShort` return what the ladder already bought, so the caller tracks and protects it, instead of returning null and leaving that position open and unmanaged. When maker and taker both fill, the result now covers the whole size.
+
 ## 0.2.0
 
 ### Minor Changes
