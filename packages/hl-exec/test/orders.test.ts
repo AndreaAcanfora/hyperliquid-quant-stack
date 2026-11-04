@@ -413,6 +413,56 @@ test('open: partial maker fill + taker fallback never exceeds the target size', 
   assert.ok(Math.abs(pos.size - 0.1) < 1e-9, `final position ${pos.size} equals the 0.1 target`);
 });
 
+/** Ladder fills `makerFill` of 0.1 BNB on step 1; IOCs follow `ioc` per attempt. */
+async function partialEntry(makerFill: number, ioc: Array<'reject' | 'throw' | 'fill'>) {
+  const { c, pos } = await dynamicPositionClient('BNB', 0);
+  const iocSizes: number[] = [];
+  let alo = 0;
+  c.exchange = fakeExchange({
+    updateLeverage: async () => ({ status: 'ok' }),
+    order: async (params: { orders: Array<Record<string, unknown>> }) => {
+      const o = params.orders[0]!;
+      const tif = (o.t as { limit: { tif: string } }).limit.tif;
+      if (tif === 'Alo') {
+        if (++alo === 1) pos.size = makerFill;
+        return { status: 'ok', response: { type: 'order', data: { statuses: [{ resting: { oid: 3000 + alo } }] } } };
+      }
+      iocSizes.push(Number(o.s));
+      const outcome = ioc[iocSizes.length - 1] ?? 'reject';
+      if (outcome === 'throw') throw new Error('Order 0: Order could not immediately match against any resting orders.');
+      if (outcome === 'reject') return { status: 'ok', response: { type: 'order', data: { statuses: [{ error: 'Order could not immediately match' }] } } };
+      pos.size += Number(o.s);
+      return { status: 'ok', response: { type: 'order', data: { statuses: [{ filled: { totalSz: String(o.s), avgPx: '675', oid: 4242 } }] } } };
+    },
+    cancel: async () => ({ status: 'ok', response: { type: 'cancel', data: { statuses: ['success'] } } }),
+  });
+  return { c, pos, iocSizes };
+}
+
+test('open: the taker failing every time still returns the partial maker fill (no orphan position)', async () => {
+  const { c, pos, iocSizes } = await partialEntry(0.04, ['throw', 'reject', 'throw']);
+  const res = await c.openLong('BNBUSDC', 67.1, 'test');
+  assert.equal(iocSizes.length, 3, 'three IOC attempts');
+  assert.ok(res, 'the 0.04 already bought is reported, not dropped');
+  assert.ok(Math.abs(res!.size - 0.04) < 1e-9 && Math.abs(pos.size - 0.04) < 1e-9);
+  assert.equal(res!.price, 671, 'priced at the position entry');
+});
+
+test('open: a rejected IOC is retried on the remainder and the result covers maker + taker', async () => {
+  const { c, pos, iocSizes } = await partialEntry(0.04, ['throw', 'fill']);
+  const res = await c.openLong('BNBUSDC', 67.1, 'test');
+  assert.deepEqual(iocSizes.map((s) => +s.toFixed(4)), [0.06, 0.06]);
+  assert.ok(Math.abs(pos.size - 0.1) < 1e-9, 'exactly the target, no double fill');
+  assert.ok(Math.abs(res!.size - 0.1) < 1e-9, `merged size ${res!.size}`);
+  assert.equal(res!.orderId, 4242, 'the taker oid, used for the fill lookup');
+});
+
+test('open: nothing filled and every IOC throwing propagates the error', async () => {
+  const { c, iocSizes } = await partialEntry(0, ['throw', 'throw', 'throw']);
+  await assert.rejects(c.openLong('BNBUSDC', 67.1, 'test'), /could not immediately match/);
+  assert.equal(iocSizes.length, 3);
+});
+
 test('open sets cross leverage once per coin, clamped to maxLeverage', async () => {
   const c = await mockedClient();
   c.targetLeverage = 50;

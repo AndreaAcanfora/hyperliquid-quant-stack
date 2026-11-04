@@ -8,6 +8,12 @@ export const DUST_NOTIONAL_USD = 1;
 /** Reduce-only IOC attempts on the remainder before a close is reported as failed. */
 export const CLOSE_IOC_ATTEMPTS = 3;
 
+/** Taker IOC attempts for an entry's remainder; each one re-reads the book. */
+export const ENTRY_IOC_ATTEMPTS = 3;
+
+/** Pause between entry IOC attempts, so the next one sees the book after the move. */
+export const ENTRY_IOC_RETRY_MS = 500;
+
 /** Taker orders are priced this far past the far side of the book, so they cross even if it moves. */
 export const TAKER_CROSS_BUFFER = 0.0025;
 

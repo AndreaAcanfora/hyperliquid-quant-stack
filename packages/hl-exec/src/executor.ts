@@ -22,7 +22,7 @@
  */
 import * as hl from '@nktkas/hyperliquid';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
-import { CLOSE_IOC_ATTEMPTS, DUST_NOTIONAL_USD, HL_MAKER_FEE_RATE, HL_TAKER_FEE_RATE, MAKER_FILLED_SHARE, NO_BOOK_SLIPPAGE, TAKER_CROSS_BUFFER } from './constants.js';
+import { CLOSE_IOC_ATTEMPTS, DUST_NOTIONAL_USD, ENTRY_IOC_ATTEMPTS, ENTRY_IOC_RETRY_MS, HL_MAKER_FEE_RATE, HL_TAKER_FEE_RATE, MAKER_FILLED_SHARE, NO_BOOK_SLIPPAGE, TAKER_CROSS_BUFFER } from './constants.js';
 import { CloseFailedError } from './errors.js';
 import { aggregateFills, mergeTradeResults, normalizeFill } from './fills.js';
 import { coinOf, intervalMs, toInterval, toMarket } from './markets.js';
@@ -920,7 +920,9 @@ export class HyperliquidExecutor implements ExchangeClient {
    * Maker-first entry (post-only ladder for `makerWaitMs`), then a
    * taker IOC for whatever the ladder left unfilled. Sizing the IOC to
    * the remainder, not the full order, keeps a partial maker fill from
-   * doubling the position.
+   * doubling the position. The taker is retried on a fresh book; if it
+   * never fills, the partial maker fill is still returned (never
+   * dropped), and only an entry that bought nothing returns null/throws.
    */
   private async _open(
     spotSymbol: string,
@@ -936,23 +938,63 @@ export class HyperliquidExecutor implements ExchangeClient {
     const beforeSize = Math.abs(Number((await this.getPositions())[market]?.size ?? 0));
     const makerResult = await this._makerLadder({ spotSymbol, side, size, reduceOnly: false, reason, resultReason: reason, ...(ctx ? { ctx } : {}) });
     if (makerResult) return makerResult;
-    const filledByMaker = Math.max(
-      0,
-      Math.abs(Number((await this.getPositions())[market]?.size ?? 0)) - beforeSize,
-    );
-    const remaining = size - filledByMaker;
-    if (remaining * mark < DUST_NOTIONAL_USD) {
-      this.logger.log('info', `HlClient ${side} ${market}: maker ladder filled ${filledByMaker} before timeout, no taker needed`);
-      return {
-        orderId: 0, market, side, size: filledByMaker, price: mark,
-        fee: filledByMaker * mark * HL_MAKER_FEE_RATE, reason,
-        timestamp: new Date().toISOString(),
-      };
+    const held = async () => {
+      const pos = (await this.getPositions())[market];
+      const moved = Math.max(0, Math.abs(Number(pos?.size ?? 0)) - beforeSize);
+      // A fresh position's entry price is the average of what we bought.
+      const px = beforeSize === 0 && Number(pos?.entryPrice) > 0 ? Number(pos?.entryPrice) : mark;
+      return { moved, px };
+    };
+    const ownFill = (filled: number, px: number): ExchangeTradeResult => ({
+      orderId: 0, market, side, size: filled, price: px,
+      fee: filled * px * HL_MAKER_FEE_RATE, reason,
+      timestamp: new Date().toISOString(),
+    });
+
+    const maker = await held();
+    if ((size - maker.moved) * mark < DUST_NOTIONAL_USD) {
+      this.logger.log('info', `HlClient ${side} ${market}: maker ladder filled ${maker.moved} before timeout, no taker needed`);
+      return ownFill(maker.moved, maker.px);
     }
-    if (filledByMaker > 0) {
-      this.logger.log('info', `HlClient ${side} ${market}: maker ladder partially filled ${filledByMaker}/${size}, taker IOC for remaining ${remaining}`);
+    if (maker.moved > 0) {
+      this.logger.log('info', `HlClient ${side} ${market}: maker ladder partially filled ${maker.moved}/${size}, taker IOC for remaining ${size - maker.moved}`);
     }
-    return this._placeMarketIoc(spotSymbol, side, remaining, false, reason);
+
+    // Taker for the remainder. In a fast move one IOC priced off the book
+    // can find nothing left at its limit, so retry on a fresh book. A
+    // rejected IOC fills nothing; the position is re-read anyway in case
+    // a thrown request did reach the venue.
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= ENTRY_IOC_ATTEMPTS; attempt++) {
+      const now = attempt === 1 ? maker : await held();
+      const remaining = size - now.moved;
+      if (remaining * mark < DUST_NOTIONAL_USD) return ownFill(now.moved, now.px);
+      try {
+        const taker = await this._placeMarketIoc(spotSymbol, side, remaining, false, reason);
+        if (taker) {
+          return now.moved > 0
+            ? mergeTradeResults([ownFill(now.moved, now.px), taker], market, side, reason)
+            : taker;
+        }
+        lastError = null;
+      } catch (err: unknown) {
+        lastError = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.log('warning', `HlClient ${side} ${market}: taker IOC attempt ${attempt}/${ENTRY_IOC_ATTEMPTS} failed: ${msg}`);
+      }
+      if (attempt < ENTRY_IOC_ATTEMPTS) await new Promise((r) => setTimeout(r, ENTRY_IOC_RETRY_MS));
+    }
+
+    // The taker never filled. Whatever the ladder bought is a real
+    // position: report it, so the caller tracks it and protects it,
+    // instead of leaving it open and unmanaged.
+    const final = await held();
+    if (final.moved * mark >= DUST_NOTIONAL_USD) {
+      this.logger.log('warning', `HlClient ${side} ${market}: taker IOC failed ${ENTRY_IOC_ATTEMPTS}x, keeping the ${final.moved}/${size} already filled`);
+      return ownFill(final.moved, final.px);
+    }
+    if (lastError) throw lastError;
+    return null;
   }
 
   async closePosition(
